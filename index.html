@@ -160,7 +160,7 @@
   .fld{margin-bottom:12px}
   .two{display:flex;gap:10px}
   .two > *{flex:1;min-width:0}
-  input[type=text],input[type=url],input[type=date],select,textarea{
+  input[type=text],input[type=url],input[type=date],input[type=email],input[type=password],select,textarea{
     width:100%;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface-2);
     color:var(--ink);font:inherit;font-size:14px;padding:9px 11px;
   }
@@ -235,6 +235,7 @@
     .cell .d{font-size:11px}
     .pill{font-size:9.5px;padding:0 3px}
     .two{flex-direction:column;gap:12px}
+    .masthead .theme-btn{padding:5px 9px}
   }
 </style>
 </head>
@@ -249,6 +250,7 @@
     <button class="theme-btn" id="exportBtn" type="button">백업</button>
     <button class="theme-btn" id="importBtn" type="button">불러오기</button>
     <input type="file" id="importFile" accept="application/json,.json" hidden>
+    <button class="theme-btn" id="authBtn" type="button">로그인</button>
     <button class="theme-btn" id="themeBtn" type="button">화면</button>
   </header>
 
@@ -436,8 +438,25 @@
   </form>
 </dialog>
 
+<!-- 클라우드 로그인 -->
+<dialog id="dlgAuth">
+  <form class="dlg-in" id="formAuth" method="dialog">
+    <h3>기기 간 자동 동기화</h3>
+    <p class="hint">Supabase에 만든 계정으로 로그인하면 링크·스크랩·일정·사진이 자동으로 동기화돼요.</p>
+    <div class="fld"><label for="authEmail">이메일</label><input id="authEmail" type="email" autocomplete="username" required></div>
+    <div class="fld"><label for="authPassword">비밀번호</label><input id="authPassword" type="password" autocomplete="current-password" required></div>
+    <div class="err" id="authErr"></div>
+    <div class="dlg-foot">
+      <span class="spacer"></span>
+      <button class="btn" type="button" data-close>취소</button>
+      <button class="btn btn-go" type="submit" id="authSubmit">로그인</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="lightbox"><img id="lightboxImg" alt="스크랩 사진"></dialog>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (function(){
   "use strict";
@@ -446,12 +465,23 @@
   var LS_SCRAP = "notice-drawer-scraps-v1";
   var LS_THEME = "notice-drawer-theme";
   var LS_TAB = "notice-drawer-tab";
+  var SUPABASE_URL = "https://hnuhwiyqonqkrtjhxihy.supabase.co";
+  var SUPABASE_PUBLISHABLE_KEY = "sb_publishable_ABZ53Khy6U5HKCmd_vsSWA_khCipKCE";
+  var PHOTO_BUCKET = "notice-images";
 
   var state = { groups: [], links: [], scraps: [], events: [] };
-  var loaded = false, docRef = null, scrapCol = null, assets = null;
-  var pending = 0, saveTimer = null;
+  var loaded = false, assets = null;
+  var saveTimer = null, cloudUser = null, cloudBusy = false, cloudDirty = false;
+  var remoteUpdatedAt = 0, uploadedPhotoIds = {};
   var filter = "", tab = "drawers";
   var lastDeleted = null, toastTimer = null;
+
+  var sb = null;
+  try{
+    if(window.supabase && window.supabase.createClient){
+      sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+    }
+  }catch(e){ sb = null; }
 
   var $ = function(id){ return document.getElementById(id); };
   function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,6); }
@@ -492,27 +522,18 @@
 
   function scheduleSave(){
     localSave();
-    if(!docRef) return;
+    cloudDirty = true;
+    if(!sb || !cloudUser) return;
     if(saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(function(){
-      saveTimer = null; pending++; setStatus("저장 중");
-      docRef.set({ groups: state.groups, links: state.links, events: state.events, updatedAt: Date.now() })
-        .then(function(){ setStatus(""); })
-        .catch(function(){ setStatus("저장 실패"); })
-        .then(function(){ pending--; });
-    }, 350);
+      saveTimer = null;
+      pushCloudState();
+    }, 650);
   }
 
   function saveScrap(s){
-    localSave();
-    if(!scrapCol) return Promise.resolve();
-    setStatus("저장 중");
-    return scrapCol.doc(s.id).set({
-      title: s.title, body: s.body || "", deadline: s.deadline || "",
-      url: s.url || "", images: s.images || [], done: !!s.done,
-      createdAt: s.createdAt, updatedAt: Date.now()
-    }).then(function(){ setStatus(""); })
-      .catch(function(){ setStatus("저장 실패"); });
+    scheduleSave();
+    return Promise.resolve();
   }
 
   function bootstrapDefaults(){
@@ -526,7 +547,7 @@
   }
 
   /* ---------- 사진 저장 (브라우저 안) ---------- */
-  var idb = null, shotUrls = {};
+  var idb = null, shotUrls = {}, idbReady = Promise.resolve(null);
   function idbOpen(){
     return new Promise(function(res, rej){
       var r = indexedDB.open("noticeDrawerShots", 1);
@@ -550,6 +571,15 @@
       tx.objectStore("shots").delete(id);
       tx.oncomplete = function(){ res(); };
       tx.onerror = function(){ res(); };
+    });
+  }
+  function idbGet(id){
+    return new Promise(function(res){
+      if(!idb){ res(null); return; }
+      var tx = idb.transaction("shots", "readonly");
+      var req = tx.objectStore("shots").get(id);
+      req.onsuccess = function(){ res(req.result || null); };
+      req.onerror = function(){ res(null); };
     });
   }
   function idbAll(){
@@ -588,7 +618,7 @@
   render();
 
   if(window.indexedDB){
-    idbOpen().then(function(d){
+    idbReady = idbOpen().then(function(d){
       idb = d;
       return idbAll();
     }).then(function(items){
@@ -598,12 +628,196 @@
       assets = null;
       $("sShotWrap").hidden = true;
       $("pasteHint").textContent = "이 브라우저에서는 사진 저장이 막혀 있어요. 글로는 기록할 수 있어요.";
+      return null;
     });
   } else {
     assets = null;
     $("sShotWrap").hidden = true;
     $("pasteHint").textContent = "이 브라우저에서는 사진 저장이 안 돼요. 글로는 기록할 수 있어요.";
   }
+
+  /* ---------- Supabase 자동 동기화 ---------- */
+  function cloudData(){
+    return { groups:state.groups, links:state.links, scraps:state.scraps, events:state.events };
+  }
+  function allPhotoIds(){
+    var ids = [];
+    state.scraps.forEach(function(s){
+      (s.images || []).forEach(function(id){ if(id && ids.indexOf(id) < 0) ids.push(id); });
+    });
+    return ids;
+  }
+  function photoPath(id){ return cloudUser.id + "/" + id; }
+  function loadUploadedPhotoIds(){
+    uploadedPhotoIds = {};
+    if(!cloudUser) return;
+    try{
+      var raw = localStorage.getItem("notice-drawer-cloud-photos-" + cloudUser.id);
+      (JSON.parse(raw || "[]") || []).forEach(function(id){ uploadedPhotoIds[id] = true; });
+    }catch(e){}
+  }
+  function rememberUploadedPhotoIds(){
+    if(!cloudUser) return;
+    try{ localStorage.setItem("notice-drawer-cloud-photos-" + cloudUser.id, JSON.stringify(Object.keys(uploadedPhotoIds))); }catch(e){}
+  }
+  function uploadLocalPhotos(){
+    if(!sb || !cloudUser || !idb) return Promise.resolve();
+    var ids = allPhotoIds().filter(function(id){ return !uploadedPhotoIds[id]; });
+    var chain = Promise.resolve();
+    ids.forEach(function(id){
+      chain = chain.then(function(){
+        return idbGet(id).then(function(blob){
+          if(!blob) return;
+          return sb.storage.from(PHOTO_BUCKET).upload(photoPath(id), blob, {
+            upsert:true,
+            contentType:blob.type || "application/octet-stream"
+          }).then(function(result){
+            if(result.error) throw result.error;
+            uploadedPhotoIds[id] = true;
+            rememberUploadedPhotoIds();
+          });
+        });
+      });
+    });
+    return chain;
+  }
+  function downloadCloudPhotos(){
+    if(!sb || !cloudUser) return Promise.resolve();
+    return idbReady.then(function(){
+      if(!idb) return;
+      var ids = allPhotoIds().filter(function(id){ return !shotUrls[id]; });
+      var chain = Promise.resolve();
+      ids.forEach(function(id){
+        chain = chain.then(function(){
+          return sb.storage.from(PHOTO_BUCKET).download(photoPath(id)).then(function(result){
+            if(result.error || !result.data) return;
+            return idbPut(id, result.data).then(function(){
+              shotUrls[id] = URL.createObjectURL(result.data);
+              uploadedPhotoIds[id] = true;
+            });
+          });
+        });
+      });
+      return chain.then(function(){ rememberUploadedPhotoIds(); render(); });
+    });
+  }
+  function pushCloudState(){
+    if(!sb || !cloudUser || cloudBusy) return Promise.resolve();
+    cloudBusy = true;
+    setStatus("동기화 중");
+    return idbReady.then(uploadLocalPhotos).then(function(){
+      return sb.from("app_state").upsert({
+        user_id:cloudUser.id,
+        data:cloudData(),
+        updated_at:new Date().toISOString()
+      }, { onConflict:"user_id" }).select("updated_at").single();
+    }).then(function(result){
+      if(result.error) throw result.error;
+      remoteUpdatedAt = new Date(result.data.updated_at).getTime() || Date.now();
+      cloudDirty = false;
+      setStatus("동기화됨");
+      setTimeout(function(){ if(!cloudBusy) setStatus(""); }, 1300);
+    }).catch(function(err){
+      console.error(err);
+      setStatus("동기화 실패");
+    }).then(function(){ cloudBusy = false; });
+  }
+  function applyCloudData(data){
+    if(!data || typeof data !== "object") return;
+    state.groups = Array.isArray(data.groups) ? data.groups : [];
+    state.links = Array.isArray(data.links) ? data.links : [];
+    state.scraps = Array.isArray(data.scraps) ? data.scraps : [];
+    state.events = Array.isArray(data.events) ? data.events : [];
+    if(!state.groups.length) bootstrapDefaults();
+    localSave();
+    loaded = true;
+    render();
+  }
+  function pullCloudState(force){
+    if(!sb || !cloudUser || cloudBusy || (cloudDirty && !force)) return Promise.resolve();
+    cloudBusy = true;
+    setStatus("불러오는 중");
+    return sb.from("app_state").select("data,updated_at").eq("user_id", cloudUser.id).maybeSingle()
+      .then(function(result){
+        if(result.error) throw result.error;
+        if(!result.data){
+          cloudBusy = false;
+          cloudDirty = true;
+          return pushCloudState();
+        }
+        var stamp = new Date(result.data.updated_at).getTime() || 0;
+        if(force || stamp > remoteUpdatedAt){
+          applyCloudData(result.data.data);
+          remoteUpdatedAt = stamp;
+        }
+        cloudDirty = false;
+        return downloadCloudPhotos();
+      }).then(function(){
+        setStatus("");
+      }).catch(function(err){
+        console.error(err);
+        setStatus("동기화 실패");
+      }).then(function(){ cloudBusy = false; });
+  }
+  function updateAuthUI(){
+    $("authBtn").textContent = cloudUser ? "동기화 중" : "로그인";
+    $("authBtn").title = cloudUser ? (cloudUser.email || "로그인됨") + " · 누르면 로그아웃" : "기기 간 자동 동기화 로그인";
+  }
+  function signedIn(user){
+    cloudUser = user;
+    remoteUpdatedAt = 0;
+    loadUploadedPhotoIds();
+    updateAuthUI();
+    pullCloudState(true);
+  }
+  function signedOut(){
+    cloudUser = null;
+    remoteUpdatedAt = 0;
+    uploadedPhotoIds = {};
+    updateAuthUI();
+    setStatus("");
+  }
+  $("authBtn").addEventListener("click", function(){
+    if(cloudUser){
+      if(confirm("이 기기에서 로그아웃할까요?")) sb.auth.signOut();
+      return;
+    }
+    if(!sb){ toast("동기화 모듈을 불러오지 못했어요. 인터넷 연결을 확인해주세요"); return; }
+    $("authErr").textContent = "";
+    $("dlgAuth").showModal();
+    setTimeout(function(){ $("authEmail").focus(); }, 30);
+  });
+  $("formAuth").addEventListener("submit", function(ev){
+    ev.preventDefault();
+    $("authErr").textContent = "";
+    $("authSubmit").disabled = true;
+    $("authSubmit").textContent = "로그인 중";
+    sb.auth.signInWithPassword({ email:$("authEmail").value.trim(), password:$("authPassword").value })
+      .then(function(result){
+        if(result.error) throw result.error;
+        $("authPassword").value = "";
+        $("dlgAuth").close();
+      }).catch(function(){
+        $("authErr").textContent = "로그인에 실패했어요. 이메일과 비밀번호를 확인해주세요.";
+      }).then(function(){
+        $("authSubmit").disabled = false;
+        $("authSubmit").textContent = "로그인";
+      });
+  });
+  if(sb){
+    sb.auth.getSession().then(function(result){
+      var session = result.data && result.data.session;
+      if(session && session.user) signedIn(session.user); else signedOut();
+    });
+    sb.auth.onAuthStateChange(function(event, session){
+      if(session && session.user){
+        if(!cloudUser || cloudUser.id !== session.user.id) signedIn(session.user);
+      } else signedOut();
+    });
+  } else updateAuthUI();
+  document.addEventListener("visibilitychange", function(){
+    if(document.visibilityState === "visible" && cloudUser) pullCloudState(false);
+  });
 
   /* ---------- url ---------- */
   function normalizeUrl(v){
@@ -874,8 +1088,7 @@
     var s = scrapById(id);
     if(!s) return;
     state.scraps = state.scraps.filter(function(x){ return x.id !== id; });
-    localSave(); render();
-    if(scrapCol) scrapCol.doc(id).delete().catch(function(){});
+    scheduleSave(); render();
     if(assets && s.images) s.images.forEach(function(aid){ assets.delete(aid).catch(function(){}); });
     toast((s.title || "스크랩") + " 삭제했어요");
   }
