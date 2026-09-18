@@ -442,13 +442,14 @@
 <dialog id="dlgAuth">
   <form class="dlg-in" id="formAuth" method="dialog">
     <h3>기기 간 자동 동기화</h3>
-    <p class="hint">Supabase에 만든 계정으로 로그인하면 링크·스크랩·일정·사진이 자동으로 동기화돼요.</p>
+    <p class="hint">처음이면 회원가입하고, 이미 계정이 있으면 로그인하세요. 링크·스크랩·일정·사진은 계정별로 안전하게 동기화돼요.</p>
     <div class="fld"><label for="authEmail">이메일</label><input id="authEmail" type="email" autocomplete="username" required></div>
-    <div class="fld"><label for="authPassword">비밀번호</label><input id="authPassword" type="password" autocomplete="current-password" required></div>
+    <div class="fld"><label for="authPassword">비밀번호</label><input id="authPassword" type="password" autocomplete="current-password" minlength="6" required></div>
     <div class="err" id="authErr"></div>
     <div class="dlg-foot">
       <span class="spacer"></span>
       <button class="btn" type="button" data-close>취소</button>
+      <button class="btn" type="button" id="authSignup">회원가입</button>
       <button class="btn btn-go" type="submit" id="authSubmit">로그인</button>
     </div>
   </form>
@@ -468,6 +469,7 @@
   var SUPABASE_URL = "https://hnuhwiyqonqkrtjhxihy.supabase.co";
   var SUPABASE_PUBLISHABLE_KEY = "sb_publishable_ABZ53Khy6U5HKCmd_vsSWA_khCipKCE";
   var PHOTO_BUCKET = "notice-images";
+  var APP_URL = "https://work-experience-app-three.vercel.app/";
 
   var state = { groups: [], links: [], scraps: [], events: [] };
   var loaded = false, assets = null;
@@ -760,7 +762,7 @@
       }).then(function(){ cloudBusy = false; });
   }
   function updateAuthUI(){
-    $("authBtn").textContent = cloudUser ? "동기화 중" : "로그인";
+    $("authBtn").textContent = cloudUser ? "동기화됨" : "로그인 · 회원가입";
     $("authBtn").title = cloudUser ? (cloudUser.email || "로그인됨") + " · 누르면 로그아웃" : "기기 간 자동 동기화 로그인";
   }
   function signedIn(user){
@@ -789,10 +791,27 @@
   });
   $("formAuth").addEventListener("submit", function(ev){
     ev.preventDefault();
+    signIn();
+  });
+  function authValues(){
+    var email = $("authEmail").value.trim();
+    var password = $("authPassword").value;
+    if(!email){ $("authErr").textContent = "이메일을 입력해주세요."; return null; }
+    if(password.length < 6){ $("authErr").textContent = "비밀번호는 6자 이상으로 만들어주세요."; return null; }
+    return { email:email, password:password };
+  }
+  function setAuthBusy(busy, label){
+    $("authSubmit").disabled = busy;
+    $("authSignup").disabled = busy;
+    $("authSubmit").textContent = busy && label === "login" ? "로그인 중" : "로그인";
+    $("authSignup").textContent = busy && label === "signup" ? "가입 중" : "회원가입";
+  }
+  function signIn(){
     $("authErr").textContent = "";
-    $("authSubmit").disabled = true;
-    $("authSubmit").textContent = "로그인 중";
-    sb.auth.signInWithPassword({ email:$("authEmail").value.trim(), password:$("authPassword").value })
+    var values = authValues();
+    if(!values) return;
+    setAuthBusy(true, "login");
+    sb.auth.signInWithPassword(values)
       .then(function(result){
         if(result.error) throw result.error;
         $("authPassword").value = "";
@@ -800,9 +819,33 @@
       }).catch(function(){
         $("authErr").textContent = "로그인에 실패했어요. 이메일과 비밀번호를 확인해주세요.";
       }).then(function(){
-        $("authSubmit").disabled = false;
-        $("authSubmit").textContent = "로그인";
+        setAuthBusy(false);
       });
+  }
+  $("authSignup").addEventListener("click", function(){
+    $("authErr").textContent = "";
+    var values = authValues();
+    if(!values) return;
+    setAuthBusy(true, "signup");
+    sb.auth.signUp({
+      email:values.email,
+      password:values.password,
+      options:{ emailRedirectTo:APP_URL }
+    }).then(function(result){
+      if(result.error) throw result.error;
+      $("authPassword").value = "";
+      if(result.data && result.data.session){
+        $("dlgAuth").close();
+        toast("회원가입과 로그인이 완료됐어요");
+      } else {
+        $("authErr").textContent = "인증메일을 보냈어요. 메일의 링크를 누른 뒤 로그인해주세요.";
+      }
+    }).catch(function(err){
+      var msg = (err && err.message) || "";
+      $("authErr").textContent = /already|registered/i.test(msg)
+        ? "이미 가입된 이메일이에요. 로그인해주세요."
+        : "회원가입에 실패했어요. 이메일과 비밀번호를 확인해주세요.";
+    }).then(function(){ setAuthBusy(false); });
   });
   if(sb){
     sb.auth.getSession().then(function(result){
