@@ -617,7 +617,8 @@
   localLoad();
   if(!state.groups.length) bootstrapDefaults();
   loaded = true;
-  render();
+  // 첫 화면은 아래 setTab(tab)에서 모든 상태와 이벤트를 초기화한 뒤 그린다.
+  // 저장된 탭이 달력이면 여기서 render()할 때 calCursor가 아직 없다.
 
   if(window.indexedDB){
     idbReady = idbOpen().then(function(d){
@@ -853,9 +854,12 @@
       if(session && session.user) signedIn(session.user); else signedOut();
     });
     sb.auth.onAuthStateChange(function(event, session){
-      if(session && session.user){
-        if(!cloudUser || cloudUser.id !== session.user.id) signedIn(session.user);
-      } else signedOut();
+      // 인증 콜백은 내부 잠금이 잡힌 상태로 실행된다. DB 조회는 잠금 해제 뒤 시작한다.
+      setTimeout(function(){
+        if(session && session.user){
+          if(!cloudUser || cloudUser.id !== session.user.id) signedIn(session.user);
+        } else signedOut();
+      }, 0);
     });
   } else updateAuthUI();
   document.addEventListener("visibilitychange", function(){
