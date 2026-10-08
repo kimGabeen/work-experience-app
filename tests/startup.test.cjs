@@ -51,7 +51,15 @@ function launch(savedTab, useCloud = false, storage = new Map()) {
     auth: {
       getSession: () => Promise.resolve({ data: { session: null } }),
       onAuthStateChange: callback => { authCallback = callback; },
-      signInWithPassword: () => Promise.resolve({ data: { user } })
+      signInWithPassword: () => Promise.resolve({ data: { user } }),
+      resetPasswordForEmail: (email, options) => {
+        calls.push({ reset: email, options });
+        return Promise.resolve({ data: {}, error: null });
+      },
+      updateUser: attributes => {
+        calls.push({ update: attributes });
+        return Promise.resolve({ data: { user }, error: null });
+      }
     },
     from(table) {
       calls.push({ table, insideAuthCallback });
@@ -129,4 +137,35 @@ test('auth callback releases its lock before any cloud query starts', async () =
   await settle();
   assert.equal(app.calls.length, 1);
   assert.equal(app.calls[0].insideAuthCallback, false);
+});
+
+test('forgot password sends a reset mail that returns to the app', async () => {
+  const app = launch('drawers', true);
+  app.elements.get('authBtn').dispatch('click');
+  app.elements.get('authForgot').dispatch('click');
+  assert.equal(app.calls.some(call => call.reset), false);
+  app.elements.get('authEmail').value = ' test@example.invalid ';
+  app.elements.get('authForgot').dispatch('click');
+  await settle();
+  const sent = app.calls.find(call => call.reset);
+  assert.equal(sent.reset, 'test@example.invalid');
+  assert.match(sent.options.redirectTo, /^https:\/\//);
+  assert.equal(app.elements.get('authForgot').disabled, false);
+});
+
+test('reset mail link opens the new password dialog and saves it', async () => {
+  const app = launch('drawers', true);
+  await settle();
+  app.auth('PASSWORD_RECOVERY');
+  app.runTimers(0);
+  assert.equal(app.elements.get('dlgReset').open, true);
+  app.elements.get('resetPassword').value = 'newpass1';
+  app.elements.get('resetPassword2').value = 'different';
+  app.elements.get('formReset').dispatch('submit');
+  assert.equal(app.calls.some(call => call.update), false);
+  app.elements.get('resetPassword2').value = 'newpass1';
+  app.elements.get('formReset').dispatch('submit');
+  await settle();
+  assert.equal(app.calls.find(call => call.update).update.password, 'newpass1');
+  assert.equal(app.elements.get('dlgReset').open, false);
 });

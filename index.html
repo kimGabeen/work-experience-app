@@ -169,7 +169,7 @@
   input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
   .chk{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--ink);margin-bottom:14px}
   .chk input{width:16px;height:16px;accent-color:var(--accent)}
-  .dlg-foot{display:flex;gap:8px;justify-content:flex-end;align-items:center}
+  .dlg-foot{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;align-items:center}
   .dlg-foot .spacer{flex:1}
   .btn{border:1px solid var(--line-strong);background:transparent;color:var(--ink);border-radius:8px;padding:8px 13px;font:inherit;font-size:14px;cursor:pointer}
   .btn:hover{border-color:var(--ink-soft)}
@@ -447,10 +447,27 @@
     <div class="fld"><label for="authPassword">비밀번호</label><input id="authPassword" type="password" autocomplete="current-password" minlength="6" required></div>
     <div class="err" id="authErr"></div>
     <div class="dlg-foot">
+      <button class="btn" type="button" id="authForgot">비밀번호 찾기</button>
       <span class="spacer"></span>
       <button class="btn" type="button" data-close>취소</button>
       <button class="btn" type="button" id="authSignup">회원가입</button>
       <button class="btn btn-go" type="submit" id="authSubmit">로그인</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 비밀번호 재설정 (메일 링크로 들어왔을 때) -->
+<dialog id="dlgReset">
+  <form class="dlg-in" id="formReset" method="dialog">
+    <h3>새 비밀번호 정하기</h3>
+    <p class="hint">앞으로 로그인할 때 쓸 새 비밀번호를 입력하세요.</p>
+    <div class="fld"><label for="resetPassword">새 비밀번호</label><input id="resetPassword" type="password" autocomplete="new-password" minlength="6" required></div>
+    <div class="fld"><label for="resetPassword2">새 비밀번호 확인</label><input id="resetPassword2" type="password" autocomplete="new-password" minlength="6" required></div>
+    <div class="err" id="resetErr"></div>
+    <div class="dlg-foot">
+      <span class="spacer"></span>
+      <button class="btn" type="button" data-close>나중에</button>
+      <button class="btn btn-go" type="submit" id="resetSubmit">변경</button>
     </div>
   </form>
 </dialog>
@@ -848,6 +865,59 @@
         : "회원가입에 실패했어요. 이메일과 비밀번호를 확인해주세요.";
     }).then(function(){ setAuthBusy(false); });
   });
+  $("authForgot").addEventListener("click", function(){
+    $("authErr").textContent = "";
+    var email = $("authEmail").value.trim();
+    if(!email){ $("authErr").textContent = "가입한 이메일을 입력한 뒤 눌러주세요."; $("authEmail").focus(); return; }
+    $("authForgot").disabled = true;
+    $("authForgot").textContent = "보내는 중";
+    sb.auth.resetPasswordForEmail(email, { redirectTo:APP_URL })
+      .then(function(result){
+        if(result.error) throw result.error;
+        $("authErr").textContent = "재설정 메일을 보냈어요. 메일의 링크를 누르면 새 비밀번호를 정할 수 있어요.";
+      }).catch(function(err){
+        var msg = (err && err.message) || "";
+        $("authErr").textContent = /rate|seconds/i.test(msg)
+          ? "잠시 후 다시 시도해주세요."
+          : "재설정 메일을 보내지 못했어요. 이메일을 확인해주세요.";
+      }).then(function(){
+        $("authForgot").disabled = false;
+        $("authForgot").textContent = "비밀번호 찾기";
+      });
+  });
+  function openReset(){
+    $("resetPassword").value = "";
+    $("resetPassword2").value = "";
+    $("resetErr").textContent = "";
+    if($("dlgAuth").open) $("dlgAuth").close();
+    if(!$("dlgReset").open) $("dlgReset").showModal();
+    setTimeout(function(){ $("resetPassword").focus(); }, 30);
+  }
+  $("formReset").addEventListener("submit", function(ev){
+    ev.preventDefault();
+    var password = $("resetPassword").value;
+    $("resetErr").textContent = "";
+    if(password.length < 6){ $("resetErr").textContent = "비밀번호는 6자 이상으로 만들어주세요."; return; }
+    if(password !== $("resetPassword2").value){ $("resetErr").textContent = "두 비밀번호가 서로 달라요."; return; }
+    $("resetSubmit").disabled = true;
+    $("resetSubmit").textContent = "변경 중";
+    sb.auth.updateUser({ password:password })
+      .then(function(result){
+        if(result.error) throw result.error;
+        $("resetPassword").value = "";
+        $("resetPassword2").value = "";
+        $("dlgReset").close();
+        toast("비밀번호를 바꿨어요");
+      }).catch(function(err){
+        var msg = (err && err.message) || "";
+        $("resetErr").textContent = /different|same/i.test(msg)
+          ? "이전과 다른 비밀번호를 입력해주세요."
+          : "비밀번호를 바꾸지 못했어요. 메일 링크를 다시 눌러 시도해주세요.";
+      }).then(function(){
+        $("resetSubmit").disabled = false;
+        $("resetSubmit").textContent = "변경";
+      });
+  });
   if(sb){
     sb.auth.getSession().then(function(result){
       var session = result.data && result.data.session;
@@ -856,6 +926,8 @@
     sb.auth.onAuthStateChange(function(event, session){
       // 인증 콜백은 내부 잠금이 잡힌 상태로 실행된다. DB 조회는 잠금 해제 뒤 시작한다.
       setTimeout(function(){
+        // 재설정 메일 링크로 들어오면 임시 로그인 상태가 되고 이 이벤트가 온다.
+        if(event === "PASSWORD_RECOVERY") openReset();
         if(session && session.user){
           if(!cloudUser || cloudUser.id !== session.user.id) signedIn(session.user);
         } else signedOut();
