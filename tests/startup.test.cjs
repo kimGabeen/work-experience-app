@@ -9,7 +9,12 @@ const script = html.match(/<script>\s*([\s\S]*?)<\/script>/)[1];
 
 // Execute the complete app with persisted browser storage and a small DOM stub.
 // No real accounts or network writes are used by these regression tests.
-function launch(savedTab, useCloud = false, storage = new Map()) {
+// `cloud` is one shared app_state row, so two launches act like two devices on one account.
+function newCloud() {
+  return { row: { user_id: 'test-user', data: { groups: [], links: [], scraps: [], events: [] }, updated_at: '2026-09-20T00:00:00.000Z' } };
+}
+
+function launch(savedTab, useCloud = false, storage = new Map(), cloud = newCloud()) {
   if (savedTab) storage.set('notice-drawer-tab', savedTab);
   function node(tagName = 'DIV') {
     const listeners = {};
@@ -46,7 +51,6 @@ function launch(savedTab, useCloud = false, storage = new Map()) {
   let insideAuthCallback = false;
   const calls = [];
   const user = { id: 'test-user', email: 'test@example.invalid' };
-  const remote = { data: { groups: [], links: [], scraps: [], events: [] }, updated_at: '2026-09-20T00:00:00Z' };
   const sb = {
     auth: {
       getSession: () => Promise.resolve({ data: { session: null } }),
@@ -63,12 +67,35 @@ function launch(savedTab, useCloud = false, storage = new Map()) {
     },
     from(table) {
       calls.push({ table, insideAuthCallback });
-      return {
-        select() { return this; }, eq() { return this; },
-        maybeSingle: () => Promise.resolve({ data: remote }),
-        upsert(data) { calls.push({ write: data }); return this; },
-        single: () => Promise.resolve({ data: { updated_at: remote.updated_at } })
+      const q = { op: 'select', filters: {}, payload: null };
+      const copy = value => JSON.parse(JSON.stringify(value));
+      const run = () => {
+        if (q.op === 'select') return { data: cloud.row ? copy(cloud.row) : null, error: null };
+        if (cloud.beforeWrite) { const hook = cloud.beforeWrite; cloud.beforeWrite = null; hook(); }
+        calls.push({ write: copy(q.payload), op: q.op });
+        if (q.op === 'upsert') {
+          cloud.row = { ...(cloud.row || {}), ...copy(q.payload) };
+        } else if (q.op === 'insert') {
+          if (cloud.row) return { data: null, error: { code: '23505' } };
+          cloud.row = copy(q.payload);
+        } else {
+          // Like `.eq('updated_at', seen)`: matches nothing if another device saved first.
+          if (!cloud.row || cloud.row.updated_at !== q.filters.updated_at) return { data: [], error: null };
+          Object.assign(cloud.row, copy(q.payload));
+        }
+        return { data: [{ updated_at: cloud.row.updated_at }], error: null };
       };
+      const builder = {
+        select() { return builder; },
+        eq(key, value) { q.filters[key] = value; return builder; },
+        insert(payload) { q.op = 'insert'; q.payload = payload; return builder; },
+        update(payload) { q.op = 'update'; q.payload = payload; return builder; },
+        upsert(payload) { q.op = 'upsert'; q.payload = payload; return builder; },
+        single: () => Promise.resolve(run()).then(result => ({ ...result, data: result.data && result.data[0] })),
+        maybeSingle: () => Promise.resolve(run()),
+        then: (resolve, reject) => Promise.resolve(run()).then(resolve, reject)
+      };
+      return builder;
     }
   };
   const window = node();
@@ -81,7 +108,7 @@ function launch(savedTab, useCloud = false, storage = new Map()) {
   });
   vm.runInContext(script, context, { filename: 'index.html' });
   return {
-    elements, document, window, storage, calls,
+    elements, document, window, storage, calls, cloud, timers,
     auth(event, session = { user }) {
       insideAuthCallback = true;
       try { authCallback(event, session); } finally { insideAuthCallback = false; }
@@ -96,6 +123,37 @@ function launch(savedTab, useCloud = false, storage = new Map()) {
 
 async function settle() {
   for (let i = 0; i < 20; i++) await Promise.resolve();
+}
+
+async function flush() {
+  for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+}
+
+async function signIn(app) {
+  await flush();
+  app.auth('SIGNED_IN');
+  app.runTimers(0);
+  await flush();
+}
+
+function addLinkVia(app, url, name) {
+  app.elements.get('addBtn').dispatch('click');
+  app.elements.get('fUrl').value = url;
+  app.elements.get('fName').value = name;
+  app.elements.get('formLink').dispatch('submit');
+}
+
+async function save(app) {
+  app.runTimers(650);
+  await flush();
+}
+
+function cloudLinks(cloud) {
+  return cloud.row.data.links.map(link => link.name).sort();
+}
+
+function localLinks(app) {
+  return JSON.parse(app.storage.get('notice-drawer-v1')).links.map(link => link.name).sort();
 }
 
 for (const tab of ['drawers', 'scraps', 'cal']) {
@@ -135,8 +193,108 @@ test('auth callback releases its lock before any cloud query starts', async () =
   assert.equal(app.calls.length, 0);
   app.runTimers(0);
   await settle();
-  assert.equal(app.calls.length, 1);
-  assert.equal(app.calls[0].insideAuthCallback, false);
+  assert.ok(app.calls.length >= 1);
+  assert.equal(app.calls[0].table, 'app_state');
+  assert.ok(app.calls.filter(call => call.table).every(call => call.insideAuthCallback === false));
+});
+
+test('a device that has not refreshed does not erase links added on another device', async () => {
+  const cloud = newCloud();
+  const phone = launch('drawers', true, new Map(), cloud);
+  const mac = launch('drawers', true, new Map(), cloud);
+  await signIn(phone);
+  await signIn(mac);
+
+  addLinkVia(phone, 'https://phone.example.invalid', 'from phone');
+  await save(phone);
+  assert.deepEqual(cloudLinks(cloud), ['from phone']);
+
+  // The Mac still shows its old list and saves without pulling first.
+  addLinkVia(mac, 'https://mac.example.invalid', 'from mac');
+  await save(mac);
+  assert.deepEqual(cloudLinks(cloud), ['from mac', 'from phone']);
+  assert.deepEqual(localLinks(mac), ['from mac', 'from phone']);
+
+  phone.document.dispatch('visibilitychange');
+  await flush();
+  assert.deepEqual(localLinks(phone), ['from mac', 'from phone']);
+  // Default drawers created on each device are not duplicated.
+  assert.equal(cloud.row.data.groups.length, 5);
+});
+
+function findButtons(app, title) {
+  const found = [];
+  const walk = node => {
+    if (node.title === title) found.push(node);
+    (node.children || []).forEach(walk);
+  };
+  app.elements.forEach(walk);
+  return found;
+}
+
+function deleteLinkVia(app, name) {
+  for (const pen of findButtons(app, '고치기')) {
+    pen.dispatch('click');
+    if (app.elements.get('fName').value === name) {
+      app.elements.get('fDel').dispatch('click');
+      return;
+    }
+  }
+  assert.fail('link not found: ' + name);
+}
+
+test('deleting on one device removes the link on the other instead of bringing it back', async () => {
+  const cloud = newCloud();
+  const phone = launch('drawers', true, new Map(), cloud);
+  const mac = launch('drawers', true, new Map(), cloud);
+  await signIn(phone);
+  addLinkVia(phone, 'https://a.example.invalid', 'a');
+  addLinkVia(phone, 'https://b.example.invalid', 'b');
+  await save(phone);
+  await signIn(mac);
+  assert.deepEqual(localLinks(mac), ['a', 'b']);
+
+  deleteLinkVia(phone, 'a');
+  await save(phone);
+  assert.deepEqual(cloudLinks(cloud), ['b']);
+
+  // The Mac still has "a" locally; its next save must not resurrect it.
+  addLinkVia(mac, 'https://c.example.invalid', 'c');
+  await save(mac);
+  assert.deepEqual(cloudLinks(cloud), ['b', 'c']);
+  assert.deepEqual(localLinks(mac), ['b', 'c']);
+});
+
+test('a save that loses the race re-reads and merges instead of overwriting', async () => {
+  const cloud = newCloud();
+  const phone = launch('drawers', true, new Map(), cloud);
+  await signIn(phone);
+  addLinkVia(phone, 'https://mine.example.invalid', 'mine');
+  // Another device saves after this device read the row but before it writes.
+  cloud.beforeWrite = () => {
+    const now = Date.now();
+    cloud.row = {
+      ...cloud.row,
+      data: { ...cloud.row.data, links: [...cloud.row.data.links,
+        { id: 'other1', name: 'theirs', url: 'https://theirs.example.invalid', groupId: 'x', memo: '', pinned: true, addedAt: now, updatedAt: now }] },
+      updated_at: new Date(Date.parse(cloud.row.updated_at) + 5).toISOString()
+    };
+  };
+  await save(phone);
+  assert.equal(cloud.beforeWrite, null);
+  assert.deepEqual(cloudLinks(cloud), ['mine', 'theirs']);
+  assert.deepEqual(localLinks(phone), ['mine', 'theirs']);
+});
+
+test('links added before signing in are kept and uploaded, not replaced by the cloud copy', async () => {
+  const cloud = newCloud();
+  cloud.row.data.links = [{ id: 'cloud1', name: 'cloud link', url: 'https://cloud.example.invalid', groupId: 'g', memo: '', pinned: true, addedAt: 1 }];
+  const phone = launch('drawers', true, new Map(), cloud);
+  await flush();
+  addLinkVia(phone, 'https://offline.example.invalid', 'offline link');
+  await signIn(phone);
+  assert.deepEqual(localLinks(phone), ['cloud link', 'offline link']);
+  assert.deepEqual(cloudLinks(cloud), ['cloud link', 'offline link']);
 });
 
 test('forgot password sends a reset mail that returns to the app', async () => {

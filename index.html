@@ -488,10 +488,15 @@
   var PHOTO_BUCKET = "notice-images";
   var APP_URL = "https://work-experience-app-three.vercel.app/";
 
-  var state = { groups: [], links: [], scraps: [], events: [] };
+  var LS_CLOUD_USER = "notice-drawer-cloud-user";
+  var COLLECTIONS = ["groups", "links", "scraps", "events"];
+  var TOMBSTONE_TTL = 180 * 86400000;
+
+  // deleted: { 항목 id: 삭제 시각 } — 다른 기기에 삭제를 전하기 위한 기록
+  var state = { groups: [], links: [], scraps: [], events: [], deleted: {} };
   var loaded = false, assets = null;
-  var saveTimer = null, cloudUser = null, cloudBusy = false, cloudDirty = false;
-  var remoteUpdatedAt = 0, uploadedPhotoIds = {};
+  var saveTimer = null, cloudUser = null, cloudBusy = false, syncAgain = false, syncPromise = null;
+  var uploadedPhotoIds = {}, lastSigs = {};
   var filter = "", tab = "drawers";
   var lastDeleted = null, toastTimer = null;
 
@@ -526,28 +531,76 @@
   /* ---------- local mirror ---------- */
   function localSave(){
     try{
-      localStorage.setItem(LS_KEY, JSON.stringify({groups:state.groups, links:state.links, events:state.events}));
+      localStorage.setItem(LS_KEY, JSON.stringify({groups:state.groups, links:state.links, events:state.events, deleted:state.deleted}));
       localStorage.setItem(LS_SCRAP, JSON.stringify(state.scraps));
     }catch(e){}
   }
   function localLoad(){
     try{
       var raw = localStorage.getItem(LS_KEY);
-      if(raw){ var d = JSON.parse(raw); if(d && Array.isArray(d.links)){ state.groups = d.groups||[]; state.links = d.links; state.events = Array.isArray(d.events)?d.events:[]; loaded = true; } }
+      if(raw){ var d = JSON.parse(raw); if(d && Array.isArray(d.links)){ state.groups = d.groups||[]; state.links = d.links; state.events = Array.isArray(d.events)?d.events:[]; state.deleted = (d.deleted && typeof d.deleted === "object") ? d.deleted : {}; loaded = true; } }
       var rs = localStorage.getItem(LS_SCRAP);
       if(rs){ var s = JSON.parse(rs); if(Array.isArray(s)) state.scraps = s; }
     }catch(e){}
   }
 
+  /* ---------- 변경 기록 ----------
+     기기끼리 합칠 때 항목 단위로 "누가 더 최근에 고쳤는지" 비교하려고,
+     저장할 때마다 바뀐 항목에 updatedAt을 찍고 사라진 항목은 deleted에 남긴다. */
+  function stableStringify(v){
+    if(Array.isArray(v)) return "[" + v.map(stableStringify).join(",") + "]";
+    if(v && typeof v === "object"){
+      return "{" + Object.keys(v).sort().map(function(k){ return JSON.stringify(k) + ":" + stableStringify(v[k]); }).join(",") + "}";
+    }
+    return JSON.stringify(v === undefined ? null : v);
+  }
+  function itemSig(item){
+    var copy = {};
+    Object.keys(item).forEach(function(k){ if(k !== "updatedAt") copy[k] = item[k]; });
+    return stableStringify(copy);
+  }
+  function takeSnapshot(){
+    lastSigs = {};
+    COLLECTIONS.forEach(function(c){
+      state[c].forEach(function(it){ if(it && it.id) lastSigs[c + ":" + it.id] = itemSig(it); });
+    });
+  }
+  function stampChanges(){
+    var now = Date.now(), seen = {};
+    COLLECTIONS.forEach(function(c){
+      state[c].forEach(function(it){
+        if(!it || !it.id) return;
+        var key = c + ":" + it.id, sig = itemSig(it);
+        seen[key] = true;
+        if(lastSigs[key] !== sig){
+          it.updatedAt = now;
+          lastSigs[key] = sig;
+          delete state.deleted[it.id];
+        }
+      });
+    });
+    Object.keys(lastSigs).forEach(function(key){
+      if(seen[key]) return;
+      state.deleted[key.slice(key.indexOf(":") + 1)] = now;
+      delete lastSigs[key];
+    });
+  }
+
   function scheduleSave(){
+    stampChanges();
     localSave();
-    cloudDirty = true;
     if(!sb || !cloudUser) return;
     if(saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(function(){
       saveTimer = null;
-      pushCloudState();
+      syncCloud();
     }, 650);
+  }
+  function flushSave(){
+    if(!saveTimer) return;
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    syncCloud();
   }
 
   function saveScrap(s){
@@ -633,6 +686,7 @@
 
   localLoad();
   if(!state.groups.length) bootstrapDefaults();
+  takeSnapshot();
   loaded = true;
   // 첫 화면은 아래 setTab(tab)에서 모든 상태와 이벤트를 초기화한 뒤 그린다.
   // 저장된 탭이 달력이면 여기서 render()할 때 calCursor가 아직 없다.
@@ -658,7 +712,7 @@
 
   /* ---------- Supabase 자동 동기화 ---------- */
   function cloudData(){
-    return { groups:state.groups, links:state.links, scraps:state.scraps, events:state.events };
+    return { groups:state.groups, links:state.links, scraps:state.scraps, events:state.events, deleted:state.deleted };
   }
   function allPhotoIds(){
     var ids = [];
@@ -721,63 +775,128 @@
       return chain.then(function(){ rememberUploadedPhotoIds(); render(); });
     });
   }
-  function pushCloudState(){
-    if(!sb || !cloudUser || cloudBusy) return Promise.resolve();
-    cloudBusy = true;
-    setStatus("동기화 중");
-    return idbReady.then(uploadLocalPhotos).then(function(){
-      return sb.from("app_state").upsert({
-        user_id:cloudUser.id,
-        data:cloudData(),
-        updated_at:new Date().toISOString()
-      }, { onConflict:"user_id" }).select("updated_at").single();
-    }).then(function(result){
+  /* 두 기기의 데이터를 항목(id) 단위로 합친다.
+     같은 항목은 updatedAt이 더 최근인 쪽, 삭제 기록이 더 최근이면 삭제. */
+  function stampOf(it){ return (it && (it.updatedAt || it.addedAt || it.createdAt)) || 0; }
+  function normalizeData(d){
+    d = (d && typeof d === "object") ? d : {};
+    var out = { deleted: (d.deleted && typeof d.deleted === "object" && !Array.isArray(d.deleted)) ? d.deleted : {} };
+    COLLECTIONS.forEach(function(c){ out[c] = Array.isArray(d[c]) ? d[c] : []; });
+    return out;
+  }
+  function mergeData(local, remote){
+    local = normalizeData(local); remote = normalizeData(remote);
+    var now = Date.now(), deleted = {};
+    [remote.deleted, local.deleted].forEach(function(d){
+      Object.keys(d).forEach(function(id){
+        var t = +d[id] || 0;
+        if(now - t < TOMBSTONE_TTL && t > (deleted[id] || 0)) deleted[id] = t;
+      });
+    });
+    var out = { deleted: deleted };
+    COLLECTIONS.forEach(function(c){
+      var byId = {}, order = [];
+      function take(list, isLocal){
+        list.forEach(function(it){
+          if(!it || !it.id) return;
+          var cur = byId[it.id];
+          if(!cur){ byId[it.id] = it; order.push(it.id); }
+          else if(stampOf(it) > stampOf(cur)) byId[it.id] = it;   // 동률이면 클라우드 쪽 유지
+        });
+      }
+      take(remote[c]); take(local[c]);
+      out[c] = order.map(function(id){ return byId[id]; }).filter(function(it){
+        var t = deleted[it.id];
+        if(t && t >= stampOf(it)) return false;
+        if(t) delete deleted[it.id];
+        return true;
+      });
+    });
+    // 새 기기에서 만든 기본 서랍이 클라우드 서랍과 이름만 같고 id가 달라 두 벌이 되는 것을 막는다.
+    var byName = {}, remap = {};
+    out.groups = out.groups.filter(function(g){
+      var name = (g.name || "").trim();
+      if(!byName[name]){ byName[name] = g; return true; }
+      remap[g.id] = byName[name].id;
+      out.deleted[g.id] = now;
+      return false;
+    });
+    out.links = out.links.map(function(l){
+      if(!remap[l.groupId]) return l;
+      var copy = {}; Object.keys(l).forEach(function(k){ copy[k] = l[k]; });
+      copy.groupId = remap[l.groupId]; copy.updatedAt = now;
+      return copy;
+    });
+    return out;
+  }
+  function applyData(d){
+    var changed = stableStringify(d) !== stableStringify(cloudData());
+    COLLECTIONS.forEach(function(c){ state[c] = d[c]; });
+    state.deleted = d.deleted;
+    if(!state.groups.length) bootstrapDefaults();
+    takeSnapshot();
+    localSave();
+    loaded = true;
+    if(changed) render();
+  }
+  function lastSyncedUser(){ try{ return localStorage.getItem(LS_CLOUD_USER); }catch(e){ return null; } }
+  function rememberSyncedUser(id){ try{ localStorage.setItem(LS_CLOUD_USER, id); }catch(e){} }
+
+  // 읽기 → 합치기 → 쓰기. 쓰기는 읽었던 updated_at이 그대로일 때만 성공하고,
+  // 그 사이 다른 기기가 먼저 저장했다면 다시 읽어서 합친다.
+  function syncOnce(user, attempt){
+    stampChanges();
+    return sb.from("app_state").select("data,updated_at").eq("user_id", user.id).maybeSingle().then(function(result){
       if(result.error) throw result.error;
-      remoteUpdatedAt = new Date(result.data.updated_at).getTime() || Date.now();
-      cloudDirty = false;
+      if(cloudUser !== user) return;
+      var row = result.data;
+      var remote = normalizeData(row && row.data);
+      var before = row ? stableStringify(remote) : null;
+      var prevUser = lastSyncedUser();
+      stampChanges();  // 조회하는 동안 고친 것도 반영
+      // 이 기기가 다른 계정과 동기화하던 기기라면 그 계정 데이터를 섞지 않고 클라우드 것으로 바꾼다.
+      var merged = (row && prevUser && prevUser !== user.id) ? remote : mergeData(cloudData(), remote);
+      applyData(merged);
+      var next = JSON.parse(JSON.stringify(cloudData()));
+      if(row && stableStringify(next) === before){ rememberSyncedUser(user.id); return; }
+      return idbReady.then(uploadLocalPhotos).then(function(){
+        var prevStamp = row ? (Date.parse(row.updated_at) || 0) : 0;
+        var stamp = new Date(Math.max(Date.now(), prevStamp + 1)).toISOString();
+        return row
+          ? sb.from("app_state").update({ data:next, updated_at:stamp })
+              .eq("user_id", user.id).eq("updated_at", row.updated_at).select("updated_at")
+          : sb.from("app_state").insert({ user_id:user.id, data:next, updated_at:stamp }).select("updated_at");
+      }).then(function(res){
+        var conflict = res.error ? res.error.code === "23505" : !(res.data && res.data.length);
+        if(res.error && !conflict) throw res.error;
+        if(conflict){
+          if(attempt >= 4) throw new Error("sync conflict retry limit");
+          return syncOnce(user, attempt + 1);
+        }
+        rememberSyncedUser(user.id);
+      });
+    });
+  }
+  function syncCloud(){
+    if(!sb || !cloudUser) return Promise.resolve();
+    if(cloudBusy){ syncAgain = true; return syncPromise; }
+    cloudBusy = true;
+    syncAgain = false;
+    var user = cloudUser;
+    setStatus("동기화 중");
+    syncPromise = syncOnce(user, 0).then(function(){
+      return downloadCloudPhotos();
+    }).then(function(){
       setStatus("동기화됨");
       setTimeout(function(){ if(!cloudBusy) setStatus(""); }, 1300);
     }).catch(function(err){
       console.error(err);
       setStatus("동기화 실패");
-    }).then(function(){ cloudBusy = false; });
-  }
-  function applyCloudData(data){
-    if(!data || typeof data !== "object") return;
-    state.groups = Array.isArray(data.groups) ? data.groups : [];
-    state.links = Array.isArray(data.links) ? data.links : [];
-    state.scraps = Array.isArray(data.scraps) ? data.scraps : [];
-    state.events = Array.isArray(data.events) ? data.events : [];
-    if(!state.groups.length) bootstrapDefaults();
-    localSave();
-    loaded = true;
-    render();
-  }
-  function pullCloudState(force){
-    if(!sb || !cloudUser || cloudBusy || (cloudDirty && !force)) return Promise.resolve();
-    cloudBusy = true;
-    setStatus("불러오는 중");
-    return sb.from("app_state").select("data,updated_at").eq("user_id", cloudUser.id).maybeSingle()
-      .then(function(result){
-        if(result.error) throw result.error;
-        if(!result.data){
-          cloudBusy = false;
-          cloudDirty = true;
-          return pushCloudState();
-        }
-        var stamp = new Date(result.data.updated_at).getTime() || 0;
-        if(force || stamp > remoteUpdatedAt){
-          applyCloudData(result.data.data);
-          remoteUpdatedAt = stamp;
-        }
-        cloudDirty = false;
-        return downloadCloudPhotos();
-      }).then(function(){
-        setStatus("");
-      }).catch(function(err){
-        console.error(err);
-        setStatus("동기화 실패");
-      }).then(function(){ cloudBusy = false; });
+    }).then(function(){
+      cloudBusy = false;
+      if(syncAgain && cloudUser) return syncCloud();
+    });
+    return syncPromise;
   }
   function updateAuthUI(){
     $("authBtn").textContent = cloudUser ? "동기화됨" : "로그인 · 회원가입";
@@ -785,14 +904,13 @@
   }
   function signedIn(user){
     cloudUser = user;
-    remoteUpdatedAt = 0;
     loadUploadedPhotoIds();
     updateAuthUI();
-    pullCloudState(true);
+    syncCloud();
   }
   function signedOut(){
     cloudUser = null;
-    remoteUpdatedAt = 0;
+    if(saveTimer){ clearTimeout(saveTimer); saveTimer = null; }
     uploadedPhotoIds = {};
     updateAuthUI();
     setStatus("");
@@ -934,9 +1052,19 @@
       }, 0);
     });
   } else updateAuthUI();
+  // 다시 보일 때·창에 포커스가 올 때·켜져 있는 동안 주기적으로 받아오고,
+  // 앱을 내리거나 닫을 때는 아직 안 보낸 변경을 바로 보낸다.
   document.addEventListener("visibilitychange", function(){
-    if(document.visibilityState === "visible" && cloudUser) pullCloudState(false);
+    if(!cloudUser) return;
+    if(document.visibilityState === "visible") syncCloud(); else flushSave();
   });
+  window.addEventListener("pagehide", flushSave);
+  window.addEventListener("focus", function(){ if(cloudUser) syncCloud(); });
+  if(typeof setInterval === "function"){
+    setInterval(function(){
+      if(cloudUser && document.visibilityState === "visible" && !saveTimer) syncCloud();
+    }, 60000);
+  }
 
   /* ---------- url ---------- */
   function normalizeUrl(v){
